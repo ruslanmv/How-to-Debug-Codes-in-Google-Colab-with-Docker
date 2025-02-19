@@ -41,7 +41,7 @@ import sys
 import re
 
 # List of available container images
-AVAILABLE_CONTAINERS = ["python:3.12", "debian:bookworm-slim", "ubuntu:latest"]
+AVAILABLE_CONTAINERS = ["python:3.12","python:3.11","python:3.10"]
 
 # --- Debugging Helper ---
 def debug_print(msg):
@@ -51,15 +51,22 @@ def clean_command_output(cmd, raw_output):
     """
     Cleans the output returned by pexpect:
       - Removes control characters (like ^D).
-      - Splits the output into lines and removes the echoed command (if present).
+      - Removes unnecessary PROMPT lines, echoed commands, and marker lines.
+      - Ensures only the relevant command output remains.
     """
     # Remove non-printable control characters (e.g., ^D which is \x04)
-    cleaned = re.sub(r'[\x04]', '', raw_output)
-    lines = cleaned.splitlines()
-    # If the first non-empty line exactly matches the command, remove it.
-    if lines and lines[0].strip() == cmd.strip():
-        lines = lines[1:]
-    return "\n".join(lines).strip()
+    cleaned = re.sub(r'\x04', '', raw_output)
+    
+    # Split into lines and remove empty lines
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    
+    # Define unwanted lines (such as the echo command, marker, and stray quotes)
+    unwanted = {"echo", "__CMD_END__", "'"}
+    
+    # Filter out lines starting with the prompt and any unwanted lines
+    filtered_lines = [line for line in lines if not (line.startswith("PROMPT>") or line in unwanted)]
+    
+    return "\n".join(filtered_lines).strip()
 
 # Function to execute commands as 'tempuser'
 def run_as_tempuser(command):
@@ -84,7 +91,12 @@ def run(command):
 def run_interactive_session(commands, container="my_container", prompt="PROMPT> "):
     """
     Spawns an interactive udocker container session as tempuser, sets a known prompt,
-    sends the list of commands, and returns the combined output.
+    sends the list of commands, and returns a tuple:
+    
+      (terminal_output, code_output)
+      
+    terminal_output: the cleaned output captured for each command (for Terminal execution)
+    code_output: the cleaned output captured after sending the exit command (for Code execution)
     """
     # Build the udocker command with interactive bash shell and volume mount.
     udocker_cmd = f"su - tempuser -c \"udocker run -t --entrypoint='/bin/bash' -i -v /home/tempuser:/home/tempuser {container}\""
@@ -110,29 +122,53 @@ def run_interactive_session(commands, container="my_container", prompt="PROMPT> 
         debug_print("Captured output so far:")
         debug_print(child.before)
         child.close()
-        return "Timeout waiting for shell prompt after setting PS1."
+        return ("Timeout waiting for shell prompt after setting PS1.", "")
     
-    # Now process each command and build a history of commands and outputs.
-    output_total = ""
+    terminal_output = ""
     for cmd in commands:
         debug_print(f"Sending command: {cmd}")
         child.sendline(cmd)
+        
+        # Wait for the prompt so that the command has finished
         try:
-            child.expect(prompt, timeout=20)
+            child.expect(prompt, timeout=60)
         except pexpect.TIMEOUT:
-            debug_print(f"Timeout waiting for output of command: {cmd}")
-            child.close()
-            return f"Timeout waiting for output of command: {cmd}"
-        # Clean the output by removing the echoed command and unwanted control characters.
-        raw_output = child.before.strip()
-        output = clean_command_output(cmd, raw_output)
-        output_total += f"> {cmd}\n{output}\n---\n"
+            debug_print(f"Timeout waiting for prompt after command: {cmd}. Skipping.")
+            terminal_output += f"> {cmd}\n[Timeout waiting for command completion]\n---\n"
+            continue
+        
+        # Send a marker so we know where the command output ends
+        marker = "__CMD_END__"
+        child.sendline(f"echo {marker}")
+        
+        try:
+            child.expect(marker, timeout=10)
+            raw_output = child.before.strip()
+        except pexpect.TIMEOUT:
+            debug_print(f"Timeout waiting for marker after command: {cmd}. Setting raw_output to empty.")
+            raw_output = ""
+        
+        debug_print(f"Raw terminal output for command '{cmd}': {raw_output}")
+        cleaned = clean_command_output(cmd, raw_output)
+        terminal_output += f"> {cmd}\n{cleaned}\n---\n"
     
-    # Send EOF (Ctrl+D) to exit the shell gracefully
-    child.sendcontrol('d')
-    child.expect(pexpect.EOF)
+    # Now exit the shell gracefully and capture the output after exit (used for Code execution)
+    child.sendline("exit")
+    try:
+        child.expect(pexpect.EOF, timeout=10)
+        raw_output = child.before.strip()
+        if commands:
+            last_cmd = commands[-1]
+        else:
+            last_cmd = ""
+        debug_print(f"Raw code execution output for command '{last_cmd}': {raw_output}")
+        cleaned_code = clean_command_output(last_cmd, raw_output)
+        code_output = f"> {last_cmd}\n{cleaned_code}\n---\n"
+    except pexpect.TIMEOUT:
+        debug_print("Timeout waiting for EOF after sending exit, closing child.")
+        code_output = "[Timeout waiting for EOF after sending exit]"
     child.close()
-    return output_total
+    return terminal_output, code_output
 
 # UI State Variables - Centralized state management
 pulled = False
@@ -232,7 +268,8 @@ def run_container():
     yield reset_run_ui(run_status)  # Update UI immediately
 
     # Use an interactive session to check that the container starts.
-    output = run_interactive_session(["echo Container Running"], container="my_container")
+    terminal_out, _ = run_interactive_session(["echo Container Running"], container="my_container")
+    output = terminal_out
     if "Timeout" in output or "Error" in output or not output:
         run_status = f"Failed to run container: {output}"
         debug_print(run_status)
@@ -268,13 +305,14 @@ def execute_code(code):
     # Try 'python' first, then 'python3' if needed.
     cmd = f"python {file_path}"
     debug_print(f"Trying command: {cmd}")
-    output = run_interactive_session([cmd], container="my_container")
-    if "not found" in output:
+    # We use the code_output (the second output) from the interactive session.
+    _, code_out = run_interactive_session([cmd], container="my_container")
+    if "not found" in code_out:
         debug_print(f"'python' not found, trying 'python3'...")
         cmd = f"python3 {file_path}"
         debug_print(f"Trying command: {cmd}")
-        output = run_interactive_session([cmd], container="my_container")
-    return output
+        _, code_out = run_interactive_session([cmd], container="my_container")
+    return code_out
 
 def execute_terminal(terminal_commands):
     """Executes terminal commands inside the container."""
@@ -287,8 +325,8 @@ def execute_terminal(terminal_commands):
     if terminal_commands:
         debug_print("Executing terminal commands inside the container...")
         commands = [cmd for cmd in terminal_commands.splitlines() if cmd.strip() != ""]
-        output = run_interactive_session(commands, container="my_container")
-        return output
+        terminal_out, _ = run_interactive_session(commands, container="my_container")
+        return terminal_out
     return "No terminal commands provided."
 
 def clear_and_stop():
@@ -369,6 +407,7 @@ with gr.Blocks() as app:
 
 # Launch app with debugging enabled (debug prints appear in the console)
 app.queue().launch(debug=True)
+
 
 ```
 
