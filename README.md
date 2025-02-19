@@ -20,6 +20,14 @@ First, we'll need to install the necessary libraries and set up our Docker conta
 
 This code installs `udocker` (a tool for running Docker containers in user space) and `gradio` (a library for creating user interfaces), pulls the latest Ubuntu image, creates a directory for our project, and finally creates a Docker container named `my-debug-container`.
 
+```
+!mkdir /home/tempuser
+!sudo chmod 700 /home/tempuser
+!sudo useradd tempuser && echo "password" | sudo passwd --stdin tempuser && runuser -u tempuser -c "whoami"
+
+```
+
+
 ### Creating the Gradio Interface
 
 Next, we'll create a Gradio interface that allows us to input our Python code, run it in the Docker container, and view the logs and terminal output. Here's the complete code:
@@ -28,11 +36,9 @@ Next, we'll create a Gradio interface that allows us to input our Python code, r
 import gradio as gr
 import subprocess
 import os
-
-!mkdir /home/tempuser
-!sudo chmod 700 /home/tempuser
-!sudo useradd tempuser && echo "password" | sudo passwd --stdin tempuser && runuser -u tempuser -c "whoami"
-
+import pexpect
+import sys
+import re
 
 # List of available container images
 AVAILABLE_CONTAINERS = ["python:3.12", "debian:bookworm-slim", "ubuntu:latest"]
@@ -40,6 +46,20 @@ AVAILABLE_CONTAINERS = ["python:3.12", "debian:bookworm-slim", "ubuntu:latest"]
 # --- Debugging Helper ---
 def debug_print(msg):
     print(f"[DEBUG] {msg}")
+
+def clean_command_output(cmd, raw_output):
+    """
+    Cleans the output returned by pexpect:
+      - Removes control characters (like ^D).
+      - Splits the output into lines and removes the echoed command (if present).
+    """
+    # Remove non-printable control characters (e.g., ^D which is \x04)
+    cleaned = re.sub(r'[\x04]', '', raw_output)
+    lines = cleaned.splitlines()
+    # If the first non-empty line exactly matches the command, remove it.
+    if lines and lines[0].strip() == cmd.strip():
+        lines = lines[1:]
+    return "\n".join(lines).strip()
 
 # Function to execute commands as 'tempuser'
 def run_as_tempuser(command):
@@ -55,10 +75,64 @@ def run_as_tempuser(command):
         debug_print(f"Command failed with stdout: {e.stdout} and stderr: {e.stderr}")
         return e.stdout, e.stderr
 
-# Wrapper function to execute commands
+# Wrapper function to execute non-interactive commands
 def run(command):
     stdout, stderr = run_as_tempuser(command)
     return stdout or "", stderr or ""
+
+# Function to run an interactive session in the container using pexpect.
+def run_interactive_session(commands, container="my_container", prompt="PROMPT> "):
+    """
+    Spawns an interactive udocker container session as tempuser, sets a known prompt,
+    sends the list of commands, and returns the combined output.
+    """
+    # Build the udocker command with interactive bash shell and volume mount.
+    udocker_cmd = f"su - tempuser -c \"udocker run -t --entrypoint='/bin/bash' -i -v /home/tempuser:/home/tempuser {container}\""
+    debug_print(f"Launching interactive session with:\n{udocker_cmd}\n")
+    
+    child = pexpect.spawn(udocker_cmd, encoding='utf-8', timeout=60)
+    child.logfile = sys.stdout  # log all output for debugging
+
+    # Wait for initial bash output (we ignore this output later)
+    try:
+        child.expect("bash", timeout=10)
+    except pexpect.TIMEOUT:
+        debug_print("Did not detect 'bash' in initial output; continuing anyway.")
+    
+    # Set terminal to 'dumb' to suppress escape sequences and set prompt
+    child.sendline("export TERM=dumb")
+    child.sendline(f"export PS1='{prompt}'")
+    child.sendline("")  # Ensure the new prompt is active
+    try:
+        child.expect(prompt, timeout=20)
+    except pexpect.TIMEOUT:
+        debug_print("Timeout waiting for container shell prompt after setting PS1.")
+        debug_print("Captured output so far:")
+        debug_print(child.before)
+        child.close()
+        return "Timeout waiting for shell prompt after setting PS1."
+    
+    # Now process each command and build a history of commands and outputs.
+    output_total = ""
+    for cmd in commands:
+        debug_print(f"Sending command: {cmd}")
+        child.sendline(cmd)
+        try:
+            child.expect(prompt, timeout=20)
+        except pexpect.TIMEOUT:
+            debug_print(f"Timeout waiting for output of command: {cmd}")
+            child.close()
+            return f"Timeout waiting for output of command: {cmd}"
+        # Clean the output by removing the echoed command and unwanted control characters.
+        raw_output = child.before.strip()
+        output = clean_command_output(cmd, raw_output)
+        output_total += f"> {cmd}\n{output}\n---\n"
+    
+    # Send EOF (Ctrl+D) to exit the shell gracefully
+    child.sendcontrol('d')
+    child.expect(pexpect.EOF)
+    child.close()
+    return output_total
 
 # UI State Variables - Centralized state management
 pulled = False
@@ -157,10 +231,10 @@ def run_container():
     debug_print(run_status)
     yield reset_run_ui(run_status)  # Update UI immediately
 
-    # Quick check to run the container; replace with desired command if needed
-    stdout, stderr = run("udocker run my_container /bin/bash -c 'exit'")
-    if "Error" in stderr or not stdout:
-        run_status = f"Failed to run container: {stderr}"
+    # Use an interactive session to check that the container starts.
+    output = run_interactive_session(["echo Container Running"], container="my_container")
+    if "Timeout" in output or "Error" in output or not output:
+        run_status = f"Failed to run container: {output}"
         debug_print(run_status)
         running = False
         yield reset_run_ui(run_status)
@@ -191,18 +265,16 @@ def execute_code(code):
         return error_msg
 
     debug_print("Executing the saved Python script inside the container...")
-    # Try 'python' first, then 'python3' if 'python' is not found
-    run_command_python = f"udocker run my_container python {file_path}" # Try 'python'
-    debug_print(f"Trying command: {run_command_python}")
-    stdout, stderr = run(run_command_python)
-    if "Error" in stderr and "not found" in stderr: # Check for "not found" in stderr to detect command absence
+    # Try 'python' first, then 'python3' if needed.
+    cmd = f"python {file_path}"
+    debug_print(f"Trying command: {cmd}")
+    output = run_interactive_session([cmd], container="my_container")
+    if "not found" in output:
         debug_print(f"'python' not found, trying 'python3'...")
-        run_command_python3 = f"udocker run my_container python3 {file_path}" # Fallback to 'python3'
-        debug_print(f"Trying command: {run_command_python3}")
-        stdout, stderr = run(run_command_python3)
-
-    log_output = stdout + "\n" + stderr
-    return log_output
+        cmd = f"python3 {file_path}"
+        debug_print(f"Trying command: {cmd}")
+        output = run_interactive_session([cmd], container="my_container")
+    return output
 
 def execute_terminal(terminal_commands):
     """Executes terminal commands inside the container."""
@@ -212,14 +284,12 @@ def execute_terminal(terminal_commands):
         debug_print(error_msg)
         return error_msg
 
-    terminal_output_str = ""
     if terminal_commands:
         debug_print("Executing terminal commands inside the container...")
-        for cmd in terminal_commands.splitlines():
-            debug_print(f"Executing terminal command: {cmd}")
-            term_stdout, term_stderr = run(f"udocker run my_container {cmd}")
-            terminal_output_str += f"> {cmd}\nStdout:\n{term_stdout}\nStderr:\n{term_stderr}\n---\n"
-    return terminal_output_str
+        commands = [cmd for cmd in terminal_commands.splitlines() if cmd.strip() != ""]
+        output = run_interactive_session(commands, container="my_container")
+        return output
+    return "No terminal commands provided."
 
 def clear_and_stop():
     global pulled, created, running, selected_container_image
@@ -253,7 +323,6 @@ with gr.Blocks() as app:
         pull_button = gr.Button("Pull Container", interactive=True)
         create_button = gr.Button("Create Container (Disabled)", interactive=False)
         run_button = gr.Button("Run Container (Disabled)", interactive=False)
-        run_code_button = gr.Button("Run Code in Container (Disabled)", interactive=False)
 
     # Status messages
     pull_status_label = gr.Textbox(value="Waiting for selection...", label="Pull Status", interactive=False)
@@ -278,28 +347,29 @@ with gr.Blocks() as app:
 
     # Button logic - using generators for status updates
     pull_button.click(pull_container, inputs=[container_dropdown],
-                        outputs=[pull_status_label, create_button, run_button],
-                        api_name="pull_container_action")
+                      outputs=[pull_status_label, create_button, run_button],
+                      api_name="pull_container_action")
     create_button.click(create_container,
                         outputs=[create_status_label, create_button, run_button],
                         api_name="create_container_action")
     run_button.click(run_container,
-                       outputs=[run_status_label, create_button, run_button, run_code_button],
-                       api_name="run_container_action")
+                    outputs=[run_status_label, create_button, run_button, code_run_button],
+                    api_name="run_container_action")
     code_run_button.click(execute_code,
-                            inputs=[code_input],
-                            outputs=[log_output],
-                            api_name="execute_code_action")
+                          inputs=[code_input],
+                          outputs=[log_output],
+                          api_name="execute_code_action")
     terminal_run_button.click(execute_terminal,
-                                    inputs=[terminal_input],
-                                    outputs=[terminal_output],
-                                    api_name="execute_terminal_action")
+                              inputs=[terminal_input],
+                              outputs=[terminal_output],
+                              api_name="execute_terminal_action")
     clear_stop_button.click(clear_and_stop,
-                                     outputs=[clear_status_label, create_button, run_button, run_code_button],
-                                     api_name="clear_and_stop_action")
+                            outputs=[clear_status_label, create_button, run_button, code_run_button],
+                            api_name="clear_and_stop_action")
 
 # Launch app with debugging enabled (debug prints appear in the console)
 app.queue().launch(debug=True)
+
 ```
 
 This code defines a function `run_code_in_container` that takes the Python code and any terminal commands as input, writes the code to a file, runs it in the Docker container, and captures the logs and terminal output. The Gradio interface provides input fields for the code and terminal commands, a button to run the code, and output boxes to display the results.
