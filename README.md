@@ -2,10 +2,12 @@
 
 Debugging code can be a real pain, especially when dealing with complex environments like Docker containers. But what if you could streamline the process and make it more interactive? In this blog post, we'll explore how to use Gradio and Google Colab to create a user-friendly debugging environment for Python code running in a Docker container.
 
+![](assets/2025-02-19-15-21-31.png)
+
 ### Why Docker and Colab?
 
 Docker provides a consistent and isolated environment for your code, ensuring that it runs the same way regardless of the underlying system. Google Colab offers free access to powerful computing resources, including GPUs, making it an ideal platform for running computationally intensive tasks. Combining these two technologies gives you a robust and accessible platform for developing and debugging your Python code.
-
+![](assets/2025-02-19-15-21-50.png)
 ### Setting up the Environment
 
 First, we'll need to install the necessary libraries and set up our Docker container in Google Colab. Here's the code to get started:
